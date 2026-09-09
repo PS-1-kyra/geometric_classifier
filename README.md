@@ -4,7 +4,7 @@
 [![PyTorch 2.0+](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**Lead Engineer:** Pranaya Shrestha  
+ Pranaya Shrestha  
 **System Role:** Stage 2 Multimodal Geometric Primitive Classifier & Sim-to-Real Generalization  
 **Project:** PS-1 — Class-Agnostic Object Detection via Geometric Primitive Analysis and Domain-Randomized Synthetic Data  
 
