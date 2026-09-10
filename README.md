@@ -194,7 +194,7 @@ print(result)
 ├── .gitignore                   # Git hygiene configuration
 ├── requirements.txt             # Pinned project dependencies
 ├── README.md                    # Master technical documentation
-├── Nimesh_guide.md              # Stage 1 integration specification
+
 │
 ├── real_classifier.py           # Production inference wrapper for Real Champion
 ├── synthetic_classifier.py      # Production inference wrapper for Synthetic Champion

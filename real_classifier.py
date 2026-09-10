@@ -57,8 +57,8 @@ from src.fusion_engine import FusionApproachA_EqualizedProjection
 # Default Model Candidate Paths
 DEFAULT_MODEL_CANDIDATES = [
     FILE_DIR / "real_model.pkl",
-    FILE_DIR / "Pranaya_to_Nimesh" / "real_model.pkl",
-    FILE_DIR.parent / "Pranaya_to_Nimesh" / "real_model.pkl",
+    FILE_DIR / "geometric_classifier" / "real_model.pkl",
+    FILE_DIR.parent / "geometric_classifier" / "real_model.pkl",
     FILE_DIR / "retail_geometry_project" / "outputs" / "retail_dinov2_fused_model.pkl",
     FILE_DIR.parent / "retail_geometry_project" / "outputs" / "retail_dinov2_fused_model.pkl",
     FILE_DIR / "outputs" / "retail_dinov2_fused_model.pkl",

@@ -117,8 +117,8 @@ except ImportError:
 # Default Model Candidate Paths
 DEFAULT_MODEL_CANDIDATES = [
     FILE_DIR / "synthetic_model.pkl",
-    FILE_DIR / "Pranaya_to_Nimesh" / "synthetic_model.pkl",
-    FILE_DIR.parent / "Pranaya_to_Nimesh" / "synthetic_model.pkl",
+    FILE_DIR / "geometric_classifier" / "synthetic_model.pkl",
+    FILE_DIR.parent / "geometric_classifier" / "synthetic_model.pkl",
     FILE_DIR / "synthetic_pipeline" / "results" / "pipeline_c_synthetic_champion.pkl",
     FILE_DIR.parent / "synthetic_pipeline" / "results" / "pipeline_c_synthetic_champion.pkl",
     FILE_DIR / "pipeline_c_synthetic_champion.pkl",
