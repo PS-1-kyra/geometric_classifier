@@ -1,22 +1,59 @@
 """
+========================================================================================
+src/pipeline_c.py — End-to-End Multimodal Geometry Primitive Classifier Pipeline
+========================================================================================
+Engineer: Pranaya Shrestha (Lead Engineer — Primitive Geometry Classifier & Sim-to-Real)
+Project:  PS-1 Class-Agnostic Geometric Primitive Analysis
 
-src/pipeline_c.py -- Multimodal Geometry Primitive Classifier
+----------------------------------------------------------------------------------------
+ARCHITECTURE & MATHEMATICAL PIPELINE OVERVIEW (FROM BASIC TO ADVANCED)
+----------------------------------------------------------------------------------------
+[Basic Concept]:
+  Pipeline C is an integrated end-to-end multimodal classification pipeline designed to take
+  a raw product crop from a retail shelf image and classify it into one of four geometric
+  primitives:
+    0: Flat        (books, chocolate bars, packaged stationery)
+    1: Cylindrical (soda cans, spray cans, beverage bottles)
+    2: Cuboid      (cereal boxes, tea boxes, rectangular cartons)
+    3: Irregular   (potato chip bags, pouches, flexible wrappers)
 
-Project:  PS-1 Class-Agnostic Primitive Analysis
+[Multimodal Dual-Branch Architecture]:
+  1. Visual Feature Branch (DINOv2 ViT-S/14):
+     - We pass the RGB crop through Meta AI's self-supervised DINOv2 Vision Transformer.
+     - Global Semantic Vector: The 384-D CLS token (`x_norm_clstoken`).
+     - Spatial Dense Context: 384-D spatial mean-pooling of all patch tokens (`x_norm_patchtokens`).
+     - Combined Visual Representation: 768-D vector (384 CLS + 384 Patch Mean).
+     - Standardized & Projected via PCA down to 128 dimensions (`F_RGB_128`).
 
-Architecture & Implementation:
-  1. Branch A (RGB): Pretrained DINOv2 ViT-S/14 (CLS + Mean-Pooled Patches)
-     -> StandardScaler -> 128-D PCA/Linear Projection (F_RGB_128).
-  2. Branch B (Geometry): 32-D Mask-Aware Depth & Surface Normal Features
-     -> RobustScaler -> 32-D PCA/Linear Projection (F_Geo_32).
-  3. Adaptive Fusion Layer:
-     F_fused = [ F_RGB_128, (depth_reliability * F_Geo_32) ]  in R^160
-  4. Calibrated Ensemble:
-     ExtraTrees(400) + HistGB(300) + RandomForest(350)
-     wrapped in CalibratedClassifierCV(method='isotonic', cv=5).
-  5. Uncertainty Guardrail:
-     Flags samples with max P(Y=k|X) < 0.45 as Uncertain/Ambiguous.
+  2. Geometric Feature Branch (Depth Anything V2 + 3D Surface Harvester):
+     - We estimate metric depth using Depth Anything V2.
+     - Refined via Guided Bilateral Filtering and 3x3 Morphological Mask Erosion.
+     - Extracts 32/35-D geometric descriptors (surface normal variances, percentiles, taper profiles).
+     - Scaled via RobustScaler and projected via PCA down to 32 dimensions (`F_Geo_32`).
 
+  3. Adaptive Reliability-Weighted Fusion Layer:
+     - F_fused = [ F_RGB_128, (R_d * F_Geo_32) ] in R^160
+     - Where R_d in [0.10, 1.0] is the dynamic depth reliability scalar measuring mask erosion
+       and gradient smoothness.
+
+  4. Calibrated Multi-Learner Ensemble:
+     - ExtraTreesClassifier (400 estimators, max_depth=20)
+     - HistGradientBoostingClassifier (300 iterations, max_depth=10)
+     - RandomForestClassifier (350 estimators, max_depth=18)
+     - Combined with soft-probability voting and calibrated with 5-fold Isotonic Regression.
+
+[4-Layer Physical Guardrails & Irregular Suppression]:
+  A frequent error in retail object detection is false positive "Irregular" classifications:
+  a cereal box with a glossy specular reflection or a can with printed text can trick a naive model
+  into predicting "Irregular". To prevent this, Pipeline C includes physical guardrails:
+    - Layer 1: Morphological Mask Erosion suppresses background shelf edge bleed.
+    - Layer 2: Physical Solidity Guardrail: Rigid cans and cuboids have high convex hull solidity
+      (solidity >= 0.70). Deformable pouches have dented silhouettes with lower solidity.
+      If solidity >= 0.70, P(Irregular) is penalized by 0.10x.
+    - Layer 3: Isotonic Probability Calibration transforms raw tree votes into true posteriors.
+    - Layer 4: Calibrated Decision Thresholding: If the top prediction is Irregular but confidence
+      is < 0.45, the prediction is rejected and reassigned to the secondary primitive.
+========================================================================================
 """
 
 import os
@@ -37,11 +74,20 @@ import torch
 import torchvision.transforms as T
 from PIL import Image
 
-from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier, HistGradientBoostingClassifier, VotingClassifier
+from sklearn.ensemble import (
+    ExtraTreesClassifier,
+    RandomForestClassifier,
+    HistGradientBoostingClassifier,
+    VotingClassifier,
+)
 from sklearn.preprocessing import StandardScaler, RobustScaler
 from sklearn.decomposition import PCA
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.metrics import classification_report, confusion_matrix, balanced_accuracy_score
+from sklearn.metrics import (
+    classification_report,
+    confusion_matrix,
+    balanced_accuracy_score,
+)
 
 from src.feature_extractor import GeometricFeatureExtractor, GEOMETRIC_FEATURE_NAMES
 
@@ -51,8 +97,13 @@ DEFAULT_MODEL_SAVE_PATH = "outputs/retail_dinov2_fused_model.pkl"
 
 
 class ModelUnpickler(pickle.Unpickler):
-    """Custom unpickler that safely remaps legacy module paths to local src."""
-    def find_class(self, module, name):
+    """
+    Custom Pickle Unpickler that safely and transparently remaps legacy module import paths
+    (e.g., 'retail_geometry_project.src' or 'synthetic_pipeline.src') to the unified 'src' package.
+    Ensures backwards compatibility with older serialized checkpoint files.
+    """
+
+    def find_class(self, module: str, name: str):
         remap = {
             "retail_geometry_project.src": "src",
             "synthetic_pipeline.src": "src",
@@ -62,12 +113,20 @@ class ModelUnpickler(pickle.Unpickler):
         for old_prefix, new_prefix in remap.items():
             if module.startswith(old_prefix):
                 module = module.replace(old_prefix, new_prefix)
-        if module in ("fusion_engine", "pipeline_c", "generalized_champion", "feature_extractor", "feature_extractor_v2"):
+        # Handle top-level module references without explicit 'src.' prefix
+        if module in (
+            "fusion_engine",
+            "pipeline_c",
+            "generalized_champion",
+            "feature_extractor",
+            "feature_extractor_v2",
+        ):
             module = f"src.{module}"
         return super().find_class(module, name)
 
 
 def safe_pickle_load(file_or_path):
+    """Safely loads a pickle file using ModelUnpickler to remap legacy paths."""
     if isinstance(file_or_path, (str, Path)):
         with open(file_or_path, "rb") as f:
             return ModelUnpickler(f).load()
@@ -76,23 +135,35 @@ def safe_pickle_load(file_or_path):
 
 class PipelineC:
     """
-    Multimodal Geometry Primitive Classifier integrating DINOv2 visual embeddings,
-    metric depth statistics, 3D surface normals, and adaptive reliability weighting.
+    Unified Multimodal Primitive Geometry Classifier.
+
+    Integrates:
+      1. Pretrained DINOv2 ViT-S/14 visual backbone (768-D representation).
+      2. Monocular depth & 3D surface normal feature extraction.
+      3. Dimensionality reduction & adaptive reliability-weighted fusion.
+      4. 3-model calibrated ensemble with 4-layer physical guardrails.
     """
+
     def __init__(self, device=None, model_path=None):
+        """
+        Initializes Pipeline C components, preprocessing transforms, and scalers.
+
+        Args:
+            device: torch.device ('cuda' or 'cpu').
+            model_path: Optional path to serialized checkpoint to load immediately.
+        """
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.geo_extractor = GeometricFeatureExtractor(device=self.device)
         self.dinov2_model = None
+
+        # Standard ImageNet normalization for DINOv2 ViT backbone
         self.dino_transform = T.Compose([
-            T.Resize((224, 224)),
-            T.ToTensor],
-        ) if False else T.Compose([
             T.Resize((224, 224)),
             T.ToTensor(),
             T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
 
-        # Feature standardizers and projectors
+        # Dual-branch feature standardizers and PCA projection layers
         self.scaler_rgb = StandardScaler()
         self.proj_rgb   = PCA(n_components=128, random_state=42)
 
@@ -107,16 +178,24 @@ class PipelineC:
             self.load(model_path)
 
     def _lazy_load_dinov2(self):
+        """Lazy loads DINOv2 ViT-S/14 weights into GPU memory only on first usage."""
         if self.dinov2_model is None:
             print("[PIPELINE C] Loading DINOv2 ViT-S/14 backbone...")
             self.dinov2_model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
             self.dinov2_model = self.dinov2_model.to(self.device)
             self.dinov2_model.eval()
 
-    def extract_dino_representation(self, rgb_crop):
+    def extract_dino_representation(self, rgb_crop: np.ndarray) -> np.ndarray:
         """
-        Extracts 768-D representation combining CLS token (384-D)
-        and Mean-Pooled spatial patch tokens (384-D).
+        Extracts a consolidated 768-dimensional visual embedding combining:
+          - 384-D CLS token: Represents global object category context.
+          - 384-D Mean-Pooled spatial patch tokens: Captures fine-grained packaging surface details.
+
+        Args:
+            rgb_crop: RGB uint8 numpy array (H, W, 3).
+
+        Returns:
+            dino_rep: Float32 numpy array of shape (768,).
         """
         self._lazy_load_dinov2()
         pil_img = Image.fromarray(rgb_crop)
@@ -124,29 +203,41 @@ class PipelineC:
 
         with torch.no_grad():
             try:
+                # Forward features extracts both cls and dense patch tokens
                 features_dict = self.dinov2_model.forward_features(tensor)
-                cls_token   = features_dict["x_norm_clstoken"].squeeze(0).cpu().numpy()
+                cls_token    = features_dict["x_norm_clstoken"].squeeze(0).cpu().numpy()
                 patch_tokens = features_dict["x_norm_patchtokens"].squeeze(0).cpu().numpy()
-                mean_patch  = np.mean(patch_tokens, axis=0)
-                dino_rep    = np.concatenate([cls_token, mean_patch])
+                mean_patch   = np.mean(patch_tokens, axis=0)
+                dino_rep     = np.concatenate([cls_token, mean_patch])
             except Exception:
-                cls_out = self.dinov2_model(tensor).squeeze(0).cpu().numpy()
+                # Fallback to standard forward call if forward_features is unsupported
+                cls_out  = self.dinov2_model(tensor).squeeze(0).cpu().numpy()
                 dino_rep = np.concatenate([cls_out, cls_out])
 
         return dino_rep.astype(np.float32)
 
     def extract_single_sample_features(self, rgb_crop, raw_depth=None, raw_mask=None):
-        """Extracts raw RGB (768-D), raw Geometry (32-D), and depth reliability score."""
+        """Extracts raw RGB (768-D), raw Geometry (32-D), and depth reliability score R_d."""
         dino_raw = self.extract_dino_representation(rgb_crop)
         _, geo_raw, reliability, clean_depth, eroded_mask = self.geo_extractor.extract_features_and_reliability(
             rgb_crop, raw_depth, raw_mask
         )
         return dino_raw, geo_raw, reliability, clean_depth, eroded_mask
 
-    def project_and_fuse(self, X_rgb_raw, X_geo_raw, reliabilities, fit=False):
+    def project_and_fuse(self, X_rgb_raw, X_geo_raw, reliabilities, fit: bool = False) -> np.ndarray:
         """
-        Standardizes, projects (RGB -> 128-D, Geo -> 32-D),
-        and applies adaptive reliability weighting to form the 160-D fused vector.
+        Applies dual-branch standardizations, PCA projections, and adaptive reliability
+        weighting to construct the 160-dimensional fused feature representation:
+          F_fused = [ F_RGB_128, (R_d * F_Geo_32) ] in R^160
+
+        Args:
+            X_rgb_raw:     Raw DINOv2 feature matrix (N, 768).
+            X_geo_raw:     Raw geometric feature matrix (N, 32).
+            reliabilities: Depth reliability scalars R_d for each sample in [0.10, 1.0].
+            fit:           If True, fits scalers and PCA projections on training data.
+
+        Returns:
+            F_fused: Float32 fused feature matrix of shape (N, 160).
         """
         if fit:
             X_rgb_scaled = self.scaler_rgb.fit_transform(X_rgb_raw)
@@ -165,6 +256,7 @@ class PipelineC:
             X_geo_scaled = self.scaler_geo.transform(X_geo_raw)
             F_geo_32 = self.proj_geo.transform(X_geo_scaled)
 
+        # Zero-pad if sample size was smaller than target projection dimensionality
         if F_rgb_128.shape[1] < 128:
             pad = np.zeros((F_rgb_128.shape[0], 128 - F_rgb_128.shape[1]), dtype=np.float32)
             F_rgb_128 = np.hstack([F_rgb_128, pad])
@@ -173,6 +265,7 @@ class PipelineC:
             pad = np.zeros((F_geo_32.shape[0], 32 - F_geo_32.shape[1]), dtype=np.float32)
             F_geo_32 = np.hstack([F_geo_32, pad])
 
+        # Dynamic reliability weighting applied to the geometry branch
         rel_weights = np.array(reliabilities, dtype=np.float32).reshape(-1, 1)
         F_geo_weighted = F_geo_32 * rel_weights
         F_fused = np.hstack([F_rgb_128, F_geo_weighted]).astype(np.float32)
@@ -181,7 +274,8 @@ class PipelineC:
 
     def build_dataset_feature_matrix(self, sample_records, cache_path=None, batch_size=32):
         """
-        Builds raw RGB and Geometry matrices for a list of sample records with caching.
+        Extracts and caches multi-modal feature matrices for an entire list of sample records.
+        Uses batched GPU inference for both DINOv2 and Depth Anything V2 for maximum throughput.
         """
         if cache_path and os.path.exists(cache_path):
             print(f"[PIPELINE C] Loading precomputed feature cache: {cache_path}")
@@ -213,7 +307,7 @@ class PipelineC:
             if not batch_imgs_rgb:
                 continue
 
-            # 1. Batched DINOv2 Feature Extraction
+            # 1. Batched DINOv2 Visual Feature Extraction
             tensors_dino = torch.stack([self.dino_transform(Image.fromarray(img)) for img in batch_imgs_rgb]).to(self.device)
             with torch.no_grad():
                 try:
@@ -270,7 +364,7 @@ class PipelineC:
 
     def fit(self, train_samples, val_samples=None, cache_dir="outputs/cache"):
         """
-        Fits Pipeline C on the training partition and validates on pristine val set.
+        Fits Pipeline C on the training partition and validates on pristine validation split.
         """
         os.makedirs(cache_dir, exist_ok=True)
         train_cache = os.path.join(cache_dir, "train_features.npz")
@@ -353,11 +447,19 @@ class PipelineC:
 
     def predict_crop(self, rgb_crop, raw_depth=None, raw_mask=None):
         """
-        Inference on a single product crop proposal.
+        Performs inference on a single product crop proposal with 4-layer physical guardrails.
+
+        Returns:
+            pred_label:   String class name ('Flat', 'Cylindrical', 'Cuboid', 'Irregular').
+            class_idx:    Integer class index [0..3].
+            confidence:   Percentage confidence score (0.0 to 100.0%).
+            prob_dict:    Dictionary mapping class names to posterior probabilities.
+            is_uncertain: Boolean flag indicating whether max probability < 0.45.
+            debug_info:   Dictionary containing intermediate depth maps, masks, and features.
         """
         assert self.is_fitted, "Pipeline C must be fitted before prediction!"
-        
-        # Check if V2 Champion model, legacy 403-dim model format, or 160-dim format
+
+        # Check if V2 Champion model, legacy 403-dim format, or 160-dim format
         if hasattr(self, "is_v2_fusion") and self.is_v2_fusion:
             # 1. DINOv2 768-D representation
             self._lazy_load_dinov2()
@@ -426,10 +528,10 @@ class PipelineC:
             )
             probs = self.classifier.predict_proba(F_fused)[0]
 
-        # -------------------------------------------------------------
-        # 4-LAYER IRREGULAR SUPPRESSION & PHYSICAL SOLIDITY GUARDRAIL
-        # -------------------------------------------------------------
-        # Layer 2: Physical Solidity Guardrail Filter (solidity >= 0.70 cannot be Irregular pouch)
+        # ------------------------------------------------------------------------------
+        # 4-LAYER PHYSICAL SOLIDITY GUARDRAIL & IRREGULAR SUPPRESSION
+        # ------------------------------------------------------------------------------
+        # Layer 2: Physical Solidity Guardrail Filter (solidity >= 0.70 cannot be an Irregular pouch)
         solidity = geo_dict.get("solidity", 0.8) if "geo_dict" in locals() else 0.8
         if solidity >= 0.70:
             probs[3] *= 0.10
@@ -464,7 +566,7 @@ class PipelineC:
         return pred_label, class_idx, confidence, prob_dict, is_uncertain, debug_info
 
     def save(self, save_path=DEFAULT_MODEL_SAVE_PATH):
-        """Saves fitted Pipeline C state."""
+        """Serializes fitted Pipeline C state to disk."""
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         state = {
             "scaler_rgb": self.scaler_rgb,
@@ -502,5 +604,5 @@ class PipelineC:
             self.is_v2_fusion = False
             self.is_legacy_403 = True
 
-        self.is_fitted  = True
+        self.is_fitted = True
         print(f"[PIPELINE C] Successfully loaded model from -> {model_path}")

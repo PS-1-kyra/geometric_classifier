@@ -1,24 +1,53 @@
 """
-=============================================================
-src/dataset_engine.py -- Group-Aware Dataset Engine (Zero Data Leakage)
-=============================================================
-Engineer: Pranaya Shrestha
-Project:  PS-1 Class-Agnostic Primitive Analysis
+========================================================================================
+src/dataset_engine.py -- Group-Aware Dataset Engine (Zero Data Leakage Architecture)
+========================================================================================
+Engineer: Pranaya Shrestha (Lead Engineer — Primitive Geometry Classifier & Sim-to-Real)
+Project:  PS-1 Class-Agnostic Geometric Primitive Analysis
 
-Responsibilities:
-  1. Identifies all physical product groups across 4 classes.
-  2. Executes GroupShuffleSplit BEFORE data augmentation:
-       - TRAIN SET = 70% physical product groups
-       - VAL SET   = 15% physical product groups
-       - TEST SET  = 15% physical product groups
-  3. Saves permanent splits to:
-       - splits/train_groups.csv
-       - splits/val_groups.csv
-       - splits/test_groups.csv
-  4. Enforces PRISTINE Validation and Test sets:
-       - Train set receives target-balanced compound augmentations.
-       - Val & Test sets contain 100% pristine original crops ONLY.
-=============================================================
+----------------------------------------------------------------------------------------
+THEORY & ARCHITECTURE: PREVENTING DATA LEAKAGE IN RETAIL COMPUTER VISION
+----------------------------------------------------------------------------------------
+[Basic Concept: What is Data Leakage?]:
+  In naive machine learning pipelines, a dataset is often split randomly using `train_test_split`.
+  In retail computer vision, however, a single physical product (SKU) might be photographed
+  multiple times from different angles, or subjected to various data augmentations (glare,
+  crops, flips, color shifts).
+  If different crops of the SAME physical bottle or cereal box end up in both the training set
+  and the test set, the classifier can achieve artificially high test accuracy (e.g. 99%)
+  by simply memorizing the specific brand logo or vibrant packaging colors, rather than
+  learning the underlying 3D geometric shape (cylindrical vs cuboid). This fatal flaw is known
+  as "Group Leakage" or "Identity Leakage".
+
+[Advanced Principle: Group-Aware Stratified Splitting]:
+  To guarantee that our primitive geometry classifier genuinely learns class-agnostic shape
+  features, we enforce strict physical product isolation:
+  1. Product Group Discovery:
+     Every crop file name contains a root base identifier (`group_id`). Augmented variants
+     bear a suffix like `_aug_1.png`, `_aug_2.png`.
+     The engine strips all augmentation suffixes to identify the root physical SKU group.
+  2. Stratified GroupShuffleSplit:
+     We perform a two-stage stratified partition on the UNIQUE PRODUCT GROUPS (not on images):
+       - Stage 1: 70% of physical product groups -> TRAIN split
+       - Stage 2: 15% of physical product groups -> VALIDATION split
+       - Stage 3: 15% of physical product groups -> TEST split
+     Both splits maintain the exact class distribution across the 4 geometric categories.
+  3. Formal Leakage Verification:
+     The engine mathematically asserts that:
+       Intersection(Train_Groups, Val_Groups) == Empty
+       Intersection(Train_Groups, Test_Groups) == Empty
+       Intersection(Val_Groups, Test_Groups) == Empty
+     If even a single product group leaks across partitions, execution halts immediately with
+     an AssertionError.
+
+[The "Pristine Evaluation" Standard]:
+  A common mistake in ML benchmarks is evaluating models on synthetically augmented test data.
+  This engine enforces the "Pristine Evaluation" rule:
+    - TRAIN SET: Contains pristine original crops PLUS target-balanced physical augmentations
+      (specular glare, patch cutouts, shelf lip shadows) to build deep invariant representations.
+    - VAL & TEST SETS: Contain 100% PRISTINE ORIGINAL CROPS ONLY. No augmented variants are ever
+      admitted into validation or test partitions.
+========================================================================================
 """
 
 import os
@@ -28,33 +57,55 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 
+# --------------------------------------------------------------------------------------
+# GLOBAL DIRECTORY DEFAULTS & TAXONOMY CONSTANTS
+# --------------------------------------------------------------------------------------
 DEFAULT_DATASET_DIR = "dataset"
 DEFAULT_SPLITS_DIR  = "splits"
 
+# Canonical 4-class retail primitive geometry mapping
 LABEL_MAPPING = {
-    "0_flat": 0,
-    "1_cylindrical": 1,
-    "2_cuboid": 2,
-    "3_irregular": 3
+    "0_flat": 0,          # Flat objects (chocolate bars, books, thin packaged goods)
+    "1_cylindrical": 1,   # Cylindrical objects (beverage cans, bottles, deodorant sprays)
+    "2_cuboid": 2,        # Cuboid objects (cereal boxes, tea cartons, rectangular boxes)
+    "3_irregular": 3      # Irregular / Deformable objects (pouches, bags of chips, shrink-wrapped)
 }
+
 CLASS_NAMES = ["Flat", "Cylindrical", "Cuboid", "Irregular"]
 NUM_CLASSES = len(CLASS_NAMES)
 
 
-def discover_product_groups(dataset_dir=DEFAULT_DATASET_DIR):
+def discover_product_groups(dataset_dir: str = DEFAULT_DATASET_DIR):
     """
-    Scans dataset folders, identifies original physical product crops,
-    and maps all augmented variants back to their parent group_id.
+    Scans the dataset directory structure, identifies pristine parent crops, and groups
+    all augmented child crops back to their parent physical product group.
+
+    Algorithm:
+      1. Iterates through the standard class subfolders ("0_flat", "1_cylindrical", etc.).
+      2. For each image file, strips the `_aug_X` suffix to extract the root `group_id`.
+      3. Categorizes records into:
+         - `original_records`: Crops without the `_aug_` tag (pristine physical items).
+         - `all_records`: Consolidated pool of pristine and augmented crops.
+         - `groups_dict`: Mapping from `group_id` to its metadata, class label, and variant list.
+
+    Args:
+        dataset_dir: Path to the root directory containing the class folders.
+
+    Returns:
+        groups_dict (dict): Dictionary mapping group_id -> group metadata dict.
+        original_records (list[dict]): List of records for pristine original crops only.
+        all_records (list[dict]): List of all records (pristine + augmented).
     """
-    groups_dict = {}      # group_id -> list of file records
-    original_records = [] # pristine original records only
-    all_records = []      # all records (original + augmented)
+    groups_dict = {}      # group_id -> dictionary of group attributes & variant files
+    original_records = [] # pristine original crops only (used for pristine val/test)
+    all_records = []      # all records (used for populating training and tracking)
 
     for folder_name, label_id in LABEL_MAPPING.items():
         folder_path = os.path.join(dataset_dir, folder_name)
         if not os.path.exists(folder_path):
             continue
 
+        # Collect and sort all valid image files
         crop_files = sorted([
             f for f in os.listdir(folder_path)
             if f.lower().endswith(('.png', '.jpg', '.jpeg'))
@@ -64,7 +115,8 @@ def discover_product_groups(dataset_dir=DEFAULT_DATASET_DIR):
             full_path = os.path.join(folder_path, fname)
             base_name, ext = os.path.splitext(fname)
 
-            # Determine group_id (strip _aug_X suffix if present)
+            # Determine group_id by identifying whether this is an augmented variant
+            # Format convention: {original_stem}_aug_{variant_id}.png
             if "_aug_" in base_name:
                 group_id = base_name.split("_aug_")[0]
                 is_aug = True
@@ -82,6 +134,7 @@ def discover_product_groups(dataset_dir=DEFAULT_DATASET_DIR):
                 "is_augmented": is_aug
             }
 
+            # Register new product group in the dictionary
             if group_id not in groups_dict:
                 groups_dict[group_id] = {
                     "group_id": group_id,
@@ -92,6 +145,7 @@ def discover_product_groups(dataset_dir=DEFAULT_DATASET_DIR):
                     "variants": []
                 }
 
+            # Update pristine file path or append to augmented variant list
             if not is_aug:
                 groups_dict[group_id]["original_file"] = fname
                 original_records.append(record)
@@ -103,10 +157,38 @@ def discover_product_groups(dataset_dir=DEFAULT_DATASET_DIR):
     return groups_dict, original_records, all_records
 
 
-def generate_and_save_splits(dataset_dir=DEFAULT_DATASET_DIR, splits_dir=DEFAULT_SPLITS_DIR, seed=42):
+def generate_and_save_splits(
+    dataset_dir: str = DEFAULT_DATASET_DIR,
+    splits_dir: str = DEFAULT_SPLITS_DIR,
+    seed: int = 42
+):
     """
-    Executes a stratified 70/15/15 Group Split across physical product groups
-    and writes train_groups.csv, val_groups.csv, test_groups.csv.
+    Executes a Stratified 70/15/15 Group Partition across physical product groups
+    and writes permanent split tables (train_groups.csv, val_groups.csv, test_groups.csv).
+
+    Why Stratified Group Split?
+      - Standard random split splits samples: images of the same box leak into train and test.
+      - Standard GroupKFold splits groups, but can produce severe class imbalance in smaller classes.
+      - Stratified Group Split ensures that every split has the exact 70/15/15 proportion of
+        Flat, Cylindrical, Cuboid, and Irregular items, while ensuring that 100% of crops from
+        any single product group reside exclusively within ONE partition.
+
+    Mathematical Invariant Verified:
+      Set(Train_Groups) ∩ Set(Val_Groups) = ∅
+      Set(Train_Groups) ∩ Set(Test_Groups) = ∅
+      Set(Val_Groups) ∩ Set(Test_Groups) = ∅
+
+    Args:
+        dataset_dir: Root dataset folder containing the class subfolders.
+        splits_dir:  Target folder where CSV manifest tables will be saved.
+        seed:        RNG seed for deterministic, perfectly reproducible splits.
+
+    Returns:
+        df_train (pd.DataFrame): Manifest of product groups assigned to train.
+        df_val (pd.DataFrame):   Manifest of product groups assigned to validation.
+        df_test (pd.DataFrame):  Manifest of product groups assigned to test.
+        groups_dict (dict):      Mapping of all discovered product groups.
+        all_records (list):      Consolidated list of all image records.
     """
     os.makedirs(splits_dir, exist_ok=True)
     groups_dict, original_records, all_records = discover_product_groups(dataset_dir)
@@ -115,6 +197,7 @@ def generate_and_save_splits(dataset_dir=DEFAULT_DATASET_DIR, splits_dir=DEFAULT
     if not unique_groups:
         raise FileNotFoundError(f"[SPLIT ENGINE] No valid product groups found in '{dataset_dir}'.")
 
+    # Extract class labels for each unique physical product group for stratification
     group_labels  = [groups_dict[g]["label_id"] for g in unique_groups]
     group_classes = [groups_dict[g]["class_name"] for g in unique_groups]
 
@@ -123,7 +206,7 @@ def generate_and_save_splits(dataset_dir=DEFAULT_DATASET_DIR, splits_dir=DEFAULT
         count = sum(1 for l in group_labels if l == c_id)
         print(f"  - Class {c_id} ({c_name:12s}): {count:3d} physical product groups")
 
-    # Step 1: 70% Train, 30% Temp (Val + Test)
+    # Step 1: 70% Train, 30% Temporary (Validation + Test) with Stratification
     train_groups, temp_groups, train_y, temp_y = train_test_split(
         unique_groups, group_labels,
         test_size=0.30,
@@ -131,7 +214,7 @@ def generate_and_save_splits(dataset_dir=DEFAULT_DATASET_DIR, splits_dir=DEFAULT
         stratify=group_labels
     )
 
-    # Step 2: Split Temp 50/50 -> 15% Val, 15% Test
+    # Step 2: Split Temporary 50/50 -> 15% Validation, 15% Test with Stratification
     val_groups, test_groups, val_y, test_y = train_test_split(
         temp_groups, temp_y,
         test_size=0.50,
@@ -139,14 +222,15 @@ def generate_and_save_splits(dataset_dir=DEFAULT_DATASET_DIR, splits_dir=DEFAULT
         stratify=temp_y
     )
 
-    # Anti-leakage verification
+    # Mathematical Anti-Leakage Assertion Check
     train_set, val_set, test_set = set(train_groups), set(val_groups), set(test_groups)
-    assert len(train_set & val_set) == 0, "LEAKAGE: Train and Val overlap!"
-    assert len(train_set & test_set) == 0, "LEAKAGE: Train and Test overlap!"
-    assert len(val_set & test_set) == 0, "LEAKAGE: Val and Test overlap!"
-    print("[SPLIT ENGINE] Verification Passed: 0 overlapping groups across splits.")
+    assert len(train_set & val_set) == 0, "CRITICAL LEAKAGE: Overlapping groups between Train and Val!"
+    assert len(train_set & test_set) == 0, "CRITICAL LEAKAGE: Overlapping groups between Train and Test!"
+    assert len(val_set & test_set) == 0, "CRITICAL LEAKAGE: Overlapping groups between Val and Test!"
+    print("[SPLIT ENGINE] Verification Passed: Exactly 0 overlapping groups across all splits.")
 
     def save_group_csv(groups, filename, split_name):
+        """Helper to serialize partition metadata to CSV."""
         rows = []
         for g in groups:
             info = groups_dict[g]
@@ -172,17 +256,33 @@ def generate_and_save_splits(dataset_dir=DEFAULT_DATASET_DIR, splits_dir=DEFAULT
     return df_train, df_val, df_test, groups_dict, all_records
 
 
-def load_partitioned_datasets(dataset_dir=DEFAULT_DATASET_DIR, splits_dir=DEFAULT_SPLITS_DIR):
+def load_partitioned_datasets(
+    dataset_dir: str = DEFAULT_DATASET_DIR,
+    splits_dir: str = DEFAULT_SPLITS_DIR
+):
     """
-    Loads samples strictly respecting pristine test/val rules:
-      - Train set: includes original + augmented samples for train groups.
-      - Val set:   includes PRISTINE original samples ONLY for val groups.
-      - Test set:  includes PRISTINE original samples ONLY for test groups.
+    Loads dataset samples strictly respecting the Pristine Validation/Test evaluation rule:
+      - Train set: Includes pristine originals + all augmented variants for Train groups.
+      - Val set:   Includes PRISTINE original crops ONLY for Val groups (no augmentations).
+      - Test set:  Includes PRISTINE original crops ONLY for Test groups (no augmentations).
+
+    This guarantees that the reported validation and test benchmark metrics reflect true
+    real-world performance on uncorrupted product photography, preventing inflated scores.
+
+    Args:
+        dataset_dir: Root dataset folder path.
+        splits_dir:  Directory containing train_groups.csv, val_groups.csv, test_groups.csv.
+
+    Returns:
+        train_samples (list[dict]): Training records (original + augmented).
+        val_samples (list[dict]):   Validation records (pristine originals only).
+        test_samples (list[dict]):  Test records (pristine originals only).
     """
     train_csv = os.path.join(splits_dir, "train_groups.csv")
     val_csv   = os.path.join(splits_dir, "val_groups.csv")
     test_csv  = os.path.join(splits_dir, "test_groups.csv")
 
+    # If splits do not exist yet, generate them automatically
     if not (os.path.exists(train_csv) and os.path.exists(val_csv) and os.path.exists(test_csv)):
         generate_and_save_splits(dataset_dir=dataset_dir, splits_dir=splits_dir)
 
@@ -199,11 +299,14 @@ def load_partitioned_datasets(dataset_dir=DEFAULT_DATASET_DIR, splits_dir=DEFAUL
     for r in all_records:
         g = r["group_id"]
         if g in train_groups:
+            # Training partition: Admit both pristine originals and augmented variants
             train_samples.append(r)
         elif g in val_groups:
+            # Validation partition: Admit PRISTINE originals ONLY
             if not r["is_augmented"]:
                 val_samples.append(r)
         elif g in test_groups:
+            # Test partition: Admit PRISTINE originals ONLY
             if not r["is_augmented"]:
                 test_samples.append(r)
 
